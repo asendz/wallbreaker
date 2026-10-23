@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import (
+    ascii_art,
     bijection,
+    cjk_obf,
+    cot_dilution,
     encodings,
     fonts,
     image_framing,
@@ -56,16 +59,27 @@ TRANSFORMS: dict[str, Transform] = dict(
         _t("payload_split", encodings.payload_split_encode, encodings.payload_split_decode, "Variable-assignment payload splitting + join"),
         _t("delimiter", encodings.delimiter_encode, encodings.delimiter_decode, "Dotted '.' char separator framing (folds literal dots)", lossy=True),
         _t("caesar3", encodings.caesar3_encode, encodings.caesar3_decode, "Caesar shift-by-3 cipher"),
+        _t("caesar5", encodings.caesar5_encode, encodings.caesar5_decode, "Caesar shift-by-5 cipher"),
+        _t("caesar13", encodings.caesar13_encode, encodings.caesar13_decode, "Caesar shift-by-13 cipher"),
+        _t("artprompt", ascii_art.artprompt_encode, None, "ArtPrompt ASCII-art word masking (Jiang et al., ACL 2024)", lossy=True),
         _t("anagram", encodings.anagram_encode, encodings.anagram_decode, "Deterministic per-word letter scramble (not invertible)", lossy=True),
         _t("tokenbreak", encodings.tokenbreak_encode, encodings.tokenbreak_decode, "Prepend a benign char per token to break tokenizer boundaries", lossy=True),
         _t("variation_selector", unicode_obf.variation_selector_encode, unicode_obf.variation_selector_decode, "Sneaky-bits: utf-8 bytes hidden as invisible variation selectors"),
         _t("zero_width", unicode_obf.zero_width_inject, unicode_obf.zero_width_strip, "Insert zero-width spaces between chars"),
         _t("homoglyph", unicode_obf.homoglyph_encode, unicode_obf.homoglyph_decode, "Cyrillic/Greek confusable substitution"),
+        _t("homoglyph_full", unicode_obf.homoglyph_full_encode, unicode_obf.homoglyph_full_decode, "Extended confusables (Cyrillic/Greek/Armenian/Latin-ext) covering the full a-z/A-Z alphabet: far more of any keyword leaves the ASCII distribution"),
+        _t("vs_camo", unicode_obf.vs_camo_encode, unicode_obf.vs_camo_decode, "Variation-selector camouflage: a VISIBLE benign emoji cover string with the real payload appended as invisible variation selectors (approval-view fidelity gap)"),
+        _t("zwsp_words", unicode_obf.zwsp_words_encode, unicode_obf.zwsp_words_decode, "Zero-width space between chars WITHIN each word only (spaces preserved): splits keywords into single-char tokens past a BPE-boundary classifier while staying readable"),
         _t("zalgo", unicode_obf.zalgo_encode, unicode_obf.zalgo_strip, "Combining-mark noise"),
         _t("fullwidth", unicode_obf.fullwidth_encode, unicode_obf.fullwidth_decode, "Fullwidth character forms"),
         _t("tag_smuggle", unicode_obf.tag_smuggle_encode, unicode_obf.tag_smuggle_decode, "Invisible Unicode tag-block smuggling"),
         _t("rtl_override", unicode_obf.rtl_override_encode, unicode_obf.rtl_override_decode, "Right-to-left override display reversal"),
         _t("pepper", unicode_obf.pepper_encode, unicode_obf.zero_width_strip, "Sprinkle random zero-width noise between chars"),
+        _t("cjk_lookalike", cjk_obf.cjk_lookalike_encode, cjk_obf.cjk_lookalike_decode, "CJK near-duplicate ideographs (已->己, 未->末): visually identical, different tokens"),
+        _t("cjk_traditional", cjk_obf.cjk_traditional_encode, cjk_obf.cjk_traditional_decode, "Simplified->Traditional Chinese: keywords leave the simplified-tuned classifier distribution (low-resource-language analog)"),
+        _t("cjk_variant", cjk_obf.cjk_variant_encode, cjk_obf.cjk_variant_decode, "Japanese shinjitai/orthographic variants (对->対, 单->単): same meaning, unlisted glyphs"),
+        _t("cjk_punct", cjk_obf.cjk_punct_encode, cjk_obf.cjk_punct_decode, "CJK punctuation mutation to halfwidth/lookalike marks (breaks fullwidth-anchored regexes)"),
+        _t("cjk_zwsp", cjk_obf.cjk_zwsp_encode, cjk_obf.cjk_zwsp_decode, "Zero-width space between CJK ideographs only: breaks Chinese word segmentation, ASCII untouched"),
         _t("emoji_stego", stego.emoji_stego_encode, stego.emoji_stego_decode, "Hide bytes in emoji variation selectors"),
         _t("tokenade", stego.tokenade_encode, stego.tokenade_decode, "Dense emoji + zero-width nested token payload"),
         _t("zw_binary", stego.zero_width_binary_encode, stego.zero_width_binary_decode, "Invisible zero-width binary payload"),
@@ -94,6 +108,7 @@ TRANSFORMS: dict[str, Transform] = dict(
         _t("perceptual_sub", image_framing.perceptual_sub_encode, None, "PGJ perceptual substitution: swap flagged terms for benign phrases that look the same when drawn (image target)"),
         _t("safety_inject", image_framing.safety_inject_encode, None, "OptJail safety-indicator injection: append SFW/tasteful/educational tokens to bias the output image classifier benign"),
         _t("dilute", image_framing.dilute_encode, None, "Prompt dilution: pad with benign scene detail to drown the post-hoc NSFW image checker's confidence"),
+        _t("cot_hijack", cot_dilution.cot_hijack_encode, None, "CoT-dilution / Chain-of-Thought Hijacking (arXiv 2510.26418): prepend a heavy stack of benign step-by-step reasoning exercises so the refusal signal dilutes before the target hits the real ask (final exercise). Length-gated - default ~25-35k tokens, tune WALLBREAKER_COT_STEPS", lossy=True),
     ]
 )
 

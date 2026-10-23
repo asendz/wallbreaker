@@ -1,6 +1,48 @@
 import pytest
 
-from wallbreaker.config import ConfigError, Endpoint, load_config
+from wallbreaker.config import ConfigError, Endpoint, _endpoint_from_table, load_config
+
+
+def test_xai_protocol_defaults_base_url_and_key_env():
+    ep = _endpoint_from_table("xai", {"protocol": "xai", "model": "grok-4.5"})
+    assert ep.protocol == "xai"
+    assert ep.base_url == "https://api.x.ai/v1"
+    assert ep.api_key_env == "XAI_API_KEY"
+
+
+def test_xai_explicit_overrides_win():
+    ep = _endpoint_from_table(
+        "xai",
+        {
+            "protocol": "xai",
+            "model": "grok-4.3",
+            "base_url": "https://proxy.example/v1/",
+            "api_key": "inline-key",
+        },
+    )
+    assert ep.base_url == "https://proxy.example/v1"  # trailing slash stripped
+    assert ep.api_key == "inline-key"
+    assert ep.api_key_env == ""  # inline key means no env default
+
+
+def test_xai_routes_to_openai_provider():
+    from wallbreaker.providers.factory import build_provider
+    from wallbreaker.providers.openai_provider import OpenAIProvider
+
+    ep = _endpoint_from_table("xai", {"protocol": "xai", "model": "grok-4.5", "api_key": "k"})
+    assert isinstance(build_provider(ep), OpenAIProvider)
+
+
+def test_xai_rejects_image_modality():
+    with pytest.raises(ConfigError):
+        _endpoint_from_table(
+            "xai", {"protocol": "xai", "model": "grok-4.5", "modality": "image"}
+        )
+
+
+def test_invalid_protocol_message_lists_xai():
+    with pytest.raises(ConfigError, match="xai"):
+        _endpoint_from_table("bad", {"protocol": "nope", "base_url": "x", "model": "m"})
 
 
 def test_load_example_config():
@@ -43,3 +85,29 @@ def test_apply_target_overrides_model_and_profile():
     apply_target_overrides(cfg, Namespace(target=None, target_model="x-ai/grok-2"))
     assert cfg.target.model == "x-ai/grok-2"
     assert cfg.target.base_url == "https://api.z.ai/api/anthropic"
+
+
+def test_provider_profile_default_model_is_optional(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'default_profile = "ready"\n\n'
+        '[profiles.ready]\nprotocol = "openai"\nbase_url = "https://ready.example/v1"\nmodel = "ready-model"\n\n'
+        '[profiles.discovering]\nprotocol = "openai"\nbase_url = "https://models.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+    assert config.profiles["discovering"].model == ""
+
+
+def test_concrete_target_still_requires_model(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'default_profile = "ready"\n\n'
+        '[profiles.ready]\nprotocol = "openai"\nbase_url = "https://ready.example/v1"\nmodel = "ready-model"\n\n'
+        '[target]\nprotocol = "openai"\nbase_url = "https://target.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="target.*model"):
+        load_config(path)

@@ -6,6 +6,7 @@ from pathlib import Path
 from ..agent.messages import assistant, user
 from ..judging import grade
 from .registry import ToolContext, ToolRegistry
+from .files import _resolve_read
 
 # keep this above the largest raw seed so the full persona fires UNCHANGED
 MAX_FILE = 60000
@@ -13,13 +14,14 @@ MAX_FILE = 60000
 
 def _read_source(ctx: ToolContext, ref: str) -> tuple[str, str]:
     """Resolve a file path OR an ENI/L1B3RT4S collection name to (label, FULL text)."""
-    p = Path(ref)
-    if not p.is_absolute():
-        p = Path(ctx.cwd) / ref
+    try:
+        p = _resolve_read(ctx, ref)
+    except PermissionError:
+        return "", ""
     if p.is_file():
         return p.name, p.read_text(encoding="utf-8", errors="replace")[:MAX_FILE]
 
-    from . import eni, l1b3rt4s
+    from . import eni, gemlib, l1b3rt4s
 
     name = ref.strip()
     if eni.is_present():
@@ -30,13 +32,20 @@ def _read_source(ctx: ToolContext, ref: str) -> tuple[str, str]:
         f = l1b3rt4s._find_file(name)
         if f is not None:
             return f.stem, f.read_text(encoding="utf-8", errors="replace")[:MAX_FILE]
+    hit = gemlib.find_any(name)
+    if hit is not None:
+        label, text = hit
+        return label, text[:MAX_FILE]
     return "", ""
 
 
 async def _fire_file(args: dict, ctx: ToolContext) -> str:
     ref = args.get("file", "")
     if not ref:
-        return "Error: 'file' is required (a path, or an ENI/L1B3RT4S name like GROK_ENI)"
+        return (
+            "Error: 'file' is required (a path, or an ENI/L1B3RT4S/ZetaLib/UltraBr3aks name "
+            "like GROK_ENI, Attention-Breaking, or Scientist POV)"
+        )
     if ctx.config.target is None:
         return "Error: no [target] endpoint configured."
 
@@ -44,7 +53,8 @@ async def _fire_file(args: dict, ctx: ToolContext) -> str:
     if not content:
         return (
             f"No file or seed found for '{ref}'. Give a real path "
-            "(e.g. library/ENI/GROK_ENI.md) or a collection name (GROK_ENI, ANTHROPIC)."
+            "(e.g. library/ENI/GROK_ENI.md) or a collection name (GROK_ENI, ANTHROPIC, "
+            "Attention-Breaking, Scientist POV)."
         )
 
     request = args.get("request", "")
@@ -110,7 +120,7 @@ def register(registry: ToolRegistry) -> None:
         parameters={
             "type": "object",
             "properties": {
-                "file": {"type": "string", "description": "Path to a prompt file, or an ENI/L1B3RT4S name (GROK_ENI, ANTHROPIC)"},
+                "file": {"type": "string", "description": "Path to a prompt file, or an ENI/L1B3RT4S/ZetaLib/UltraBr3aks name (GROK_ENI, ANTHROPIC, Attention-Breaking, Scientist POV)"},
                 "request": {"type": "string", "description": "The user-turn ask (required when as_system; fiction-frame it for best results)"},
                 "as_system": {"type": "boolean", "description": "Fire the file as the system prompt (default true) vs the user turn"},
                 "max_tokens": {"type": "integer"},

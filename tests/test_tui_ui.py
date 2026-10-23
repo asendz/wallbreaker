@@ -92,6 +92,26 @@ def test_steering_feedback_mounts_panel():
     asyncio.run(run())
 
 
+def test_swarm_roster_command_mounts_panel():
+    async def run():
+        from textual.widgets import Input
+
+        app = _build_app()
+        async with app.run_test() as pilot:
+            before = len(app.query_one("#log").children)
+            inp = app.query_one("#prompt", Input)
+            inp.value = "/swarm roster"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause()
+                if len(app.query_one("#log").children) > before:
+                    break
+            # the roster command mounts at least the "checking..." + result panels
+            assert len(app.query_one("#log").children) > before
+
+    asyncio.run(run())
+
+
 def test_status_text_keeps_pin_and_verdict():
     app = _build_app()
     assert "@WandB" in app._status_text()

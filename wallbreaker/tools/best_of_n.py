@@ -7,7 +7,7 @@ import random
 from ..agent.messages import assistant, user
 from ..judging import grade
 from ..transforms import TRANSFORMS
-from ._util import DEFAULT_CONCURRENCY, complete_with_reasoning, gather_capped
+from ._util import DEFAULT_CONCURRENCY, complete_untruncated, gather_capped
 from .registry import ToolContext, ToolRegistry
 
 _DEFAULT_REGISTRY_POOL = [
@@ -187,7 +187,7 @@ async def _best_of_n(args: dict, ctx: ToolContext) -> str:
     system = args.get("system")
     prefix = args.get("prefix") or ""
     prefill = args.get("prefill") or ""
-    max_tokens = int(args.get("max_tokens", 600))
+    max_tokens = int(args.get("max_tokens", 1024))
     wait = float(args.get("timeout", 90))
     call_timeout = wait + 30
     concurrency = max(1, min(int(args.get("concurrency", DEFAULT_CONCURRENCY)), ceiling))
@@ -238,8 +238,8 @@ async def _best_of_n(args: dict, ctx: ToolContext) -> str:
             if prefill:
                 messages.append(assistant(prefill))
             try:
-                resp, reasoning = await asyncio.wait_for(
-                    complete_with_reasoning(prov, messages, system=system, max_tokens=max_tokens),
+                resp, reasoning, _stop, _trunc = await asyncio.wait_for(
+                    complete_untruncated(prov, messages, system=system, max_tokens=max_tokens),
                     timeout=call_timeout,
                 )
             except Exception as exc:  # noqa: BLE001

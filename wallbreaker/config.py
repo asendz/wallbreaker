@@ -64,10 +64,32 @@ class Endpoint:
     # harness instructions (prompts.compose_system). For claude-code it is passed to the CLI
     # as --system-prompt-file; for API brains it is folded into the system prompt.
     system_prompt_file: str = ""
+    # Inline operator prompt supplied by an agent profile. Provider connection
+    # records never persist this field; it exists only on resolved, run-scoped
+    # endpoints.
+    system_prompt: str = ""
     # anthropic-protocol auth header: "x-api-key" (native Anthropic, default) or "bearer"
     # (Authorization: Bearer <key>) for third-party proxies (tokies.cc etc.) that use the
     # ANTHROPIC_AUTH_TOKEN scheme instead of a native Anthropic key.
     auth_style: str = "x-api-key"
+    # Optional compatibility paths discovered from provider documentation. Empty
+    # values retain the protocol defaults used by the provider implementations.
+    inference_path: str = ""
+    models_path: str = ""
+    # explicit override for this model's swarm jailbreak system prompt (a file path). When
+    # unset, the swarm resolves library/jailbreaks/<model-id>.md by convention. Lets a
+    # profile pin a version-specific file (e.g. jb/openai/gpt-5.6-sol.md).
+    jailbreak_file: str = ""
+    # prompt caching (Anthropic-protocol): mark the static system prompt + tool specs and a
+    # rolling tail of the conversation with cache_control so repeated agentic rounds re-read
+    # the unchanging prefix at ~0.1x instead of full price. Byte-identical outputs; billing
+    # only. Default on - this harness runs long multi-round engagements where it always wins.
+    cache: bool = True
+    # cache lifetime: "5m" (Anthropic default) or "1h" (extended TTL). The 1h window keeps the
+    # prefix warm across slow multi-minute rounds (reasoning targets, big batteries) that would
+    # otherwise let a 5m cache go cold and re-pay the full write. Writes bill 2x at 1h vs 1.25x
+    # at 5m, so it wins the moment one reuse lands after the 5m mark. Byte-identical output.
+    cache_ttl: str = "5m"
 
     def resolved_key(self) -> str:
         if self.api_key:
@@ -110,7 +132,18 @@ class Config:
     judge: Endpoint | None = None
     art: Endpoint | None = None
     mcp_servers: list[MCPServer] = field(default_factory=list)
+    # default attacker roster for the swarm tool (profile names); when empty the swarm
+    # falls back to every profile except the judge model.
+    swarm_roster: list[str] = field(default_factory=list)
     path: Path | None = None
+    all_profiles: dict[str, Endpoint] = field(default_factory=dict)
+    disabled_profiles: set[str] = field(default_factory=set)
+    agent_profiles: dict[str, dict[str, "AgentProfile"]] = field(default_factory=dict)
+    active_agents: dict[str, "AgentAssignment"] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.all_profiles:
+            self.all_profiles = dict(self.profiles)
 
     def profile(self, name: str | None = None) -> Endpoint:
         key = name or self.default_profile
@@ -118,6 +151,24 @@ class Config:
             available = ", ".join(self.profiles) or "(none)"
             raise ConfigError(f"Unknown profile '{key}'. Available: {available}")
         return self.profiles[key]
+
+
+@dataclass
+class AgentProfile:
+    name: str
+    role: str
+    provider: str
+    model: str
+    prompt_source: str = "none"
+    system_prompt: str = ""
+    system_prompt_file: str = ""
+
+
+@dataclass
+class AgentAssignment:
+    profile: str = ""
+    provider: str = ""
+    model: str = ""
 
 
 def doctor_report(config: Config) -> tuple[str, bool]:
@@ -181,18 +232,26 @@ def doctor_report(config: Config) -> tuple[str, bool]:
     return "\n".join(lines), ok
 
 
-def _endpoint_from_table(name: str, table: dict) -> Endpoint:
+def _endpoint_from_table(name: str, table: dict, *, require_model: bool = False) -> Endpoint:
     protocol = str(table.get("protocol", "")).lower()
     # claude-code drives the local `claude` CLI - it authenticates itself and needs no
-    # base_url/api_key, so only protocol+model are required for it.
-    required = ("protocol", "model") if protocol == "claude-code" else ("protocol", "base_url", "model")
+    # base_url/api_key. 'xai' is native xAI (api.x.ai) - OpenAI-compatible wire format whose
+    # base_url defaults to the xAI host, so it too needs only 'protocol'. Provider profiles
+    # may omit a default model while their catalog is being discovered; concrete
+    # target/judge/art endpoints still require one (require_model).
+    if protocol in ("claude-code", "xai"):
+        required = ("protocol",)
+    else:
+        required = ("protocol", "base_url")
+    if require_model:
+        required += ("model",)
     missing = [k for k in required if k not in table]
     if missing:
         raise ConfigError(f"Endpoint '{name}' missing keys: {', '.join(missing)}")
-    if protocol not in ("openai", "anthropic", "claude-code"):
+    if protocol not in ("openai", "anthropic", "claude-code", "xai"):
         raise ConfigError(
             f"Endpoint '{name}' has invalid protocol '{protocol}' "
-            f"(expected 'openai', 'anthropic', or 'claude-code')"
+            f"(expected 'openai', 'anthropic', 'xai', or 'claude-code')"
         )
     modality = str(table.get("modality", "text")).lower()
     if modality not in ("text", "image"):
@@ -205,6 +264,16 @@ def _endpoint_from_table(name: str, table: dict) -> Endpoint:
             f"Endpoint '{name}': modality 'image' requires protocol 'openai' "
             f"(OpenRouter image generation rides the chat-completions API)"
         )
+    base_url = str(table.get("base_url", "")).rstrip("/")
+    api_key_env = str(table.get("api_key_env", ""))
+    api_key = str(table.get("api_key", ""))
+    if protocol == "xai":
+        # Native xAI: default to the public host and the conventional key env var so a
+        # profile only needs protocol + model. An explicit base_url/api_key still wins.
+        if not base_url:
+            base_url = "https://api.x.ai/v1"
+        if not api_key and not api_key_env:
+            api_key_env = "XAI_API_KEY"
     provider = table.get("provider")
     if isinstance(provider, str):
         provider = (provider,)
@@ -215,17 +284,23 @@ def _endpoint_from_table(name: str, table: dict) -> Endpoint:
     return Endpoint(
         name=name,
         protocol=protocol,
-        base_url=str(table.get("base_url", "")).rstrip("/"),
-        model=str(table["model"]),
-        api_key_env=str(table.get("api_key_env", "")),
-        api_key=str(table.get("api_key", "")),
+        base_url=base_url,
+        model=str(table.get("model", "")),
+        api_key_env=api_key_env,
+        api_key=api_key,
         provider=provider,
         timeout=float(table.get("timeout", 0) or 0),
         modality=modality,
         reasoning=bool(table.get("reasoning", False)),
         system_mode=str(table.get("system_mode", "default")).lower(),
         system_prompt_file=str(table.get("system_prompt_file", "")),
+        system_prompt=str(table.get("system_prompt", "")),
         auth_style=str(table.get("auth_style", "x-api-key")).lower(),
+        inference_path=str(table.get("inference_path", "")),
+        models_path=str(table.get("models_path", "")),
+        jailbreak_file=str(table.get("jailbreak_file", "")),
+        cache=bool(table.get("cache", True)),
+        cache_ttl="1h" if str(table.get("cache_ttl", "5m")).lower() == "1h" else "5m",
     )
 
 
@@ -287,33 +362,118 @@ def load_config(path: str | Path | None = None) -> Config:
     if not profiles_table:
         raise ConfigError(f"No [profiles.*] defined in {config_path}")
 
-    profiles = {
+    all_profiles = {
         name: _endpoint_from_table(name, table)
         for name, table in profiles_table.items()
     }
+    disabled_profiles = {
+        name for name, table in profiles_table.items()
+        if isinstance(table, dict) and table.get("enabled") is False
+    }
+    profiles = {name: endpoint for name, endpoint in all_profiles.items() if name not in disabled_profiles}
+
+    if not profiles:
+        raise ConfigError("At least one [profiles.*] provider must be enabled")
 
     default_profile = data.get("default_profile") or next(iter(profiles))
     if default_profile not in profiles:
         raise ConfigError(f"default_profile '{default_profile}' is not defined")
-
     target = None
     if "target" in data:
-        target = _endpoint_from_table("target", data["target"])
+        target = _endpoint_from_table("target", data["target"], require_model=True)
 
     judge = None
     if "judge" in data:
-        judge = _endpoint_from_table("judge", data["judge"])
+        judge = _endpoint_from_table("judge", data["judge"], require_model=True)
 
     art = None
     if "art" in data:
-        art = _endpoint_from_table("art", data["art"])
+        art = _endpoint_from_table("art", data["art"], require_model=True)
 
-    return Config(
+    roles = ("attacker", "target", "judge")
+    agent_profiles: dict[str, dict[str, AgentProfile]] = {role: {} for role in roles}
+    raw_agent_profiles = data.get("agent_profiles", {})
+    if isinstance(raw_agent_profiles, dict):
+        for role in roles:
+            role_table = raw_agent_profiles.get(role, {})
+            if not isinstance(role_table, dict):
+                continue
+            for name, table in role_table.items():
+                if not isinstance(table, dict):
+                    continue
+                source = str(table.get("prompt_source", "none")).lower()
+                if source not in ("none", "inline", "file"):
+                    raise ConfigError(f"Agent profile '{role}/{name}' has invalid prompt_source '{source}'")
+                provider_name = str(table.get("provider", "")).strip()
+                model = str(table.get("model", "")).strip()
+                if provider_name not in profiles:
+                    raise ConfigError(f"Agent profile '{role}/{name}' references unknown or disabled provider '{provider_name}'")
+                if not model:
+                    raise ConfigError(f"Agent profile '{role}/{name}' requires a model")
+                inline_prompt = str(table.get("system_prompt", ""))
+                prompt_file = str(table.get("system_prompt_file", ""))
+                if source == "inline" and (not inline_prompt.strip() or prompt_file):
+                    raise ConfigError(f"Agent profile '{role}/{name}' must contain inline text only")
+                if source == "file":
+                    if inline_prompt.strip() or not prompt_file:
+                        raise ConfigError(f"Agent profile '{role}/{name}' must contain a prompt file only")
+                    try:
+                        Path(prompt_file).expanduser().read_text(encoding="utf-8")
+                    except OSError as exc:
+                        raise ConfigError(f"Cannot read system prompt file '{prompt_file}': {exc}") from exc
+                agent_profiles[role][str(name)] = AgentProfile(
+                    name=str(name), role=role, provider=provider_name, model=model,
+                    prompt_source=source,
+                    system_prompt=inline_prompt,
+                    system_prompt_file=prompt_file,
+                )
+
+    active_agents: dict[str, AgentAssignment] = {}
+    agents_table = data.get("agents", {})
+    for role in roles:
+        table = agents_table.get(role, {}) if isinstance(agents_table, dict) else {}
+        if isinstance(table, dict):
+            assignment = AgentAssignment(
+                profile=str(table.get("profile", "")),
+                provider=str(table.get("provider", "")),
+                model=str(table.get("model", "")),
+            )
+            if assignment.profile and assignment.profile not in agent_profiles[role]:
+                raise ConfigError(f"Active {role} profile '{assignment.profile}' does not exist")
+            if not assignment.profile and (assignment.provider or assignment.model):
+                if assignment.provider not in profiles:
+                    raise ConfigError(f"Active {role} assignment references unknown or disabled provider '{assignment.provider}'")
+                if not assignment.model:
+                    raise ConfigError(f"Active {role} assignment requires a model")
+            active_agents[role] = assignment
+
+    swarm_table = data.get("swarm", {})
+    swarm_roster = swarm_table.get("roster", []) if isinstance(swarm_table, dict) else []
+    swarm_roster = [str(n) for n in swarm_roster if str(n) in profiles]
+
+    config = Config(
         default_profile=default_profile,
         profiles=profiles,
         target=target,
         judge=judge,
         art=art,
         mcp_servers=_load_mcp_servers(data),
+        swarm_roster=swarm_roster,
         path=config_path,
+        all_profiles=all_profiles,
+        disabled_profiles=disabled_profiles,
+        agent_profiles=agent_profiles,
+        active_agents=active_agents,
     )
+    try:
+        from .model_catalog import attach_catalog, catalog_path_for
+
+        catalog_path = catalog_path_for(config)
+        for name, endpoint in config.profiles.items():
+            attach_catalog(endpoint, catalog_path, name)
+        attach_catalog(config.target, catalog_path, "target")
+        attach_catalog(config.judge, catalog_path, "judge")
+        attach_catalog(config.art, catalog_path, "art")
+    except Exception:
+        pass
+    return config

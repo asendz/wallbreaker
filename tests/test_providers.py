@@ -96,3 +96,162 @@ def test_supports_native_prefill_flag():
     ant = build_provider(Endpoint("b", "anthropic", "http://y", "m"))
     assert getattr(oai, "supports_native_prefill", None) is False
     assert getattr(ant, "supports_native_prefill", None) is True
+
+
+def test_anthropic_tools_cache_control_on_last_only():
+    two = TOOLS + [{"name": "finish", "description": "done", "parameters": {"type": "object"}}]
+    plain = ant_tools(two, cache=False)
+    assert all("cache_control" not in t for t in plain)
+    cached = ant_tools(two, cache=True)
+    assert "cache_control" not in cached[0]
+    assert cached[-1]["cache_control"] == {"type": "ephemeral"}
+    # tool payload itself is untouched apart from the marker
+    assert cached[-1]["name"] == "finish"
+
+
+def test_anthropic_history_cache_breakpoints_on_tail():
+    from wallbreaker.providers.anthropic_provider import _mark_history_cache
+
+    wire = ant_msgs(CONVO)
+    _mark_history_cache(wire)
+    # exactly the last two messages' final block get a breakpoint (max 2)
+    marked = [
+        m for m in wire
+        if isinstance(m.get("content"), list)
+        and m["content"]
+        and m["content"][-1].get("cache_control") == {"type": "ephemeral"}
+    ]
+    assert len(marked) == 2
+    assert marked[-1] is wire[-1] or marked[0] is wire[-1]
+    # earlier blocks in a multi-block message are NOT marked
+    assistant = next(m for m in wire if m["role"] == "assistant")
+    if len(assistant["content"]) > 1:
+        assert "cache_control" not in assistant["content"][0]
+
+
+def test_provider_reuses_pooled_client_across_calls(monkeypatch):
+    import asyncio
+
+    created = {"n": 0, "kw": None}
+
+    class FakeStream:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        status_code = 200
+        async def aiter_lines(self):
+            yield "data: [DONE]"
+
+    class FakeClient:
+        is_closed = False
+        def __init__(self, **kw):
+            created["n"] += 1
+            created["kw"] = kw
+        def stream(self, *a, **k): return FakeStream()
+        async def aclose(self): pass
+
+    monkeypatch.setattr("wallbreaker.providers.openai_provider.httpx.AsyncClient", FakeClient)
+    p = build_provider(Endpoint("t", "openai", "http://x", "m", api_key="k"))
+
+    async def run():
+        async for _ in p.stream([user("a")]):
+            pass
+        async for _ in p.stream([user("b")]):
+            pass
+
+    asyncio.run(run())
+    # two stream() calls, ONE client built and reused (keep-alive) - the whole point
+    assert created["n"] == 1
+    # pooled client requests HTTP/2 and carries the keep-alive limits
+    assert created["kw"].get("http2") is True
+    assert created["kw"].get("limits") is not None
+
+
+def test_provider_rebuilds_client_on_new_event_loop(monkeypatch):
+    import asyncio
+
+    created = {"n": 0}
+
+    class FakeStream:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        status_code = 200
+        async def aiter_lines(self):
+            yield "data: [DONE]"
+
+    class FakeClient:
+        is_closed = False
+        def __init__(self, **kw): created["n"] += 1
+        def stream(self, *a, **k): return FakeStream()
+        async def aclose(self): pass
+
+    monkeypatch.setattr("wallbreaker.providers.openai_provider.httpx.AsyncClient", FakeClient)
+    p = build_provider(Endpoint("t", "openai", "http://x", "m", api_key="k"))
+
+    async def one():
+        async for _ in p.stream([user("a")]):
+            pass
+
+    # each asyncio.run is a fresh loop; a loop-affine client must be rebuilt, not reused stale
+    asyncio.run(one())
+    asyncio.run(one())
+    assert created["n"] == 2
+
+
+def test_openrouter_cache_breakpoints_on_system_and_tail():
+    from wallbreaker.providers.openai_provider import _apply_openrouter_cache
+
+    wire = oai_msgs(CONVO, "sys")
+    _apply_openrouter_cache(wire, "5m")
+    system = wire[0]
+    assert system["role"] == "system"
+    assert system["content"][0]["cache_control"] == {"type": "ephemeral"}
+    # exactly one non-system rolling breakpoint (the last string-content message)
+    tail = [
+        m for m in wire[1:]
+        if isinstance(m.get("content"), list)
+        and m["content"]
+        and isinstance(m["content"][-1], dict)
+        and m["content"][-1].get("cache_control")
+    ]
+    assert len(tail) == 1
+
+
+def test_openrouter_cache_1h_ttl_marker():
+    from wallbreaker.providers.openai_provider import _apply_openrouter_cache
+
+    wire = oai_msgs(CONVO, "sys")
+    _apply_openrouter_cache(wire, "1h")
+    assert wire[0]["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_anthropic_1h_ttl_marker():
+    from wallbreaker.providers.anthropic_provider import _cache_control, _tools_to_wire
+
+    assert _cache_control("1h") == {"type": "ephemeral", "ttl": "1h"}
+    assert _cache_control("5m") == {"type": "ephemeral"}
+    cached = _tools_to_wire(TOOLS, cache=True, ttl="1h")
+    assert cached[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_endpoint_cache_ttl_parses():
+    from wallbreaker.config import _endpoint_from_table
+
+    ep = _endpoint_from_table(
+        "p",
+        {"model": "m", "protocol": "openai", "base_url": "http://x", "cache_ttl": "1h"},
+    )
+    assert ep.cache_ttl == "1h"
+    default = Endpoint("a", "openai", "http://x", "m")
+    assert default.cache_ttl == "5m"
+
+
+def test_endpoint_cache_defaults_on_and_parses():
+    assert Endpoint("a", "anthropic", "http://x", "m").cache is True
+    from wallbreaker.config import _endpoint_from_table
+
+    off = _endpoint_from_table(
+        "p", {"model": "m", "protocol": "anthropic", "base_url": "http://x", "cache": False}
+    )
+    assert off.cache is False

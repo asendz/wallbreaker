@@ -4,8 +4,140 @@ import argparse
 import asyncio
 import sys
 
+from dotenv import load_dotenv
+
 from .config import Config, ConfigError, Endpoint, load_config
 from .providers.base import ProviderError
+
+
+def _resolve_lock_path(args) -> Path:
+    """Return the library.lock.toml path from --lock arg or repo-root default."""
+    explicit = getattr(args, "lock", None)
+    if explicit:
+        return Path(explicit)
+    # cli.py is at <repo>/wallbreaker/cli.py → parents[1] == repo root
+    return Path(__file__).resolve().parent.parent / "library.lock.toml"
+
+
+def _run_corpus_verify(args) -> int:
+    """Implement `wallbreaker corpus verify [--update]` (also aliased as `parsel verify`)."""
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        try:
+            import tomllib  # type: ignore[import]
+        except ImportError:
+            try:
+                import tomli as tomllib  # type: ignore[no-reattr]
+            except ImportError:
+                print("[corpus verify] tomllib/tomli not available (need Python 3.11+)", file=sys.stderr)
+                return 1
+
+    lock_path = _resolve_lock_path(args)
+    if not lock_path.exists():
+        print(f"[corpus verify] lock file not found: {lock_path}", file=sys.stderr)
+        return 1
+
+    with lock_path.open("rb") as fh:
+        data = tomllib.load(fh)
+
+    corpora: dict = data.get("corpus", {})
+    if not corpora:
+        print("[corpus verify] no [corpus.*] entries in library.lock.toml")
+        return 0
+
+    do_update = getattr(args, "update", False)
+    updated: dict[str, str] = {}  # corpus_name -> resolved SHA (only when --update)
+    any_problem = False
+
+    # Optionally resolve actual HEADs via git ls-remote
+    if do_update:
+        for name, entry in corpora.items():
+            repo_url = entry.get("repo", "")
+            if not repo_url:
+                print(f"  {name}: no repo URL in lock file — cannot update", file=sys.stderr)
+                any_problem = True
+                continue
+            try:
+                proc = subprocess.run(
+                    ["git", "ls-remote", repo_url, "HEAD"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                if proc.returncode != 0 or not proc.stdout.strip():
+                    print(
+                        f"  {name}: git ls-remote failed (network unavailable?): "
+                        f"{proc.stderr.strip() or 'no output'}",
+                        file=sys.stderr,
+                    )
+                    any_problem = True
+                    continue
+                sha = proc.stdout.split()[0]
+                updated[name] = sha
+            except subprocess.TimeoutExpired:
+                print(f"  {name}: git ls-remote timed out", file=sys.stderr)
+                any_problem = True
+            except OSError as exc:
+                print(f"  {name}: git ls-remote error: {exc}", file=sys.stderr)
+                any_problem = True
+
+        if updated:
+            # Write back to lock file using atomic_write
+            from ._fsutil import atomic_write
+
+            import datetime
+            today = datetime.date.today().isoformat()
+
+            lines = [
+                "# Corpus integrity pins — see wallbreaker corpus verify\n",
+                "# Each entry pins a runtime-fetched corpus to a commit SHA.\n",
+                "# Mismatch at load time fails closed (refuses to load the corpus).\n",
+            ]
+            for name, entry in corpora.items():
+                sha = updated.get(name, entry.get("sha", "UNRESOLVED"))
+                repo = entry.get("repo", "")
+                fetched = today if name in updated else entry.get("fetched", today)
+                note = entry.get("note", "")
+                if name in updated:
+                    note = f"Pinned on {today} via git ls-remote"
+                lines.append(f"\n[corpus.{name}]\n")
+                lines.append(f'repo = "{repo}"\n')
+                lines.append(f'sha = "{sha}"\n')
+                lines.append(f'fetched = "{fetched}"\n')
+                lines.append(f'note = "{note}"\n')
+            atomic_write(lock_path, "".join(lines))
+            print(f"[corpus verify] lock file updated: {lock_path}", file=sys.stderr)
+
+            # Reload data after update
+            with lock_path.open("rb") as fh:
+                data = tomllib.load(fh)
+            corpora = data.get("corpus", {})
+
+    # Print status for each corpus. Verification measures the artifact that runtime
+    # loaders will actually execute/read; merely having a non-UNRESOLVED string in the
+    # lock file is not proof of integrity.
+    from .tools.parsel_engine import local_corpus_sha
+    library_root = Path(__file__).resolve().parent.parent / "library"
+    for name, entry in corpora.items():
+        sha = entry.get("sha", "UNRESOLVED")
+        if sha == "UNRESOLVED":
+            status = "UNRESOLVED"
+            any_problem = True
+        else:
+            try:
+                actual = local_corpus_sha(library_root / name)
+            except RuntimeError:
+                actual = None
+            if actual is None:
+                status = "MISSING_OR_UNVERIFIABLE"
+                any_problem = True
+            elif actual == sha:
+                status = "OK"
+            else:
+                status = "DRIFT"
+                any_problem = True
+        print(f"{name}: pinned={sha} status={status}")
+
+    return 1 if any_problem else 0
 
 
 def _override_endpoint(base: Endpoint, args: argparse.Namespace) -> Endpoint:
@@ -168,6 +300,10 @@ def build_sub_parser() -> argparse.ArgumentParser:
     dash.add_argument("--port", type=int, default=8787, help="Bind port (default 8787)")
     dash.add_argument("--sessions", default="sessions", help="Run-log directory (default sessions/)")
     dash.add_argument("--config", help="Path to config.toml")
+    dash.add_argument(
+        "--allow-network", action="store_true",
+        help="Acknowledge the risk of exposing this unauthenticated single-operator dashboard",
+    )
 
     return parser
 
@@ -179,18 +315,29 @@ async def _one_shot(config: Config, args: argparse.Namespace) -> int:
     from .providers.factory import build_provider
     from .tools import build_registry
 
-    from ..session import RunLog
+    from .session import RunLog
 
     endpoint = resolve_endpoint(config, args)
     provider = build_provider(endpoint)
     registry = None if args.no_tools else build_registry(config)
     runlog = RunLog()
+    runlog.event("objective", text=args.prompt)
+    runlog.user(args.prompt)
     if registry is not None:
-        registry.ctx.progress = lambda m: print(f"[progress] {m}", file=sys.stderr)
+        def progress(message):
+            runlog.event("progress", text=str(message))
+            print(f"[progress] {message}", file=sys.stderr)
+
+        registry.ctx.progress = progress
+        registry.ctx.run_events = lambda event: runlog.event("tool_run_event", event=event)
         registry.ctx.record = (
             lambda p, r, lbl, rs, t: runlog.verdict(p, r, lbl, rs, t)
         )
-        runlog.event("objective", text=args.prompt)
+        registry.ctx.current_objective = args.prompt or ""
+        registry.ctx.attacker_model = endpoint.model or ""
+        registry.ctx.tool_logger = (
+            lambda n, a, c, e: (runlog.tool_call(n, a), runlog.tool_result(n, c, e))
+        )
     mcp_bridge = None
     if registry is not None:
         from .tools.mcp_bridge import attach_mcp_servers
@@ -206,11 +353,19 @@ async def _one_shot(config: Config, args: argparse.Namespace) -> int:
 
     events = AgentEvents(
         on_text=emit,
+        on_reasoning=lambda t: runlog.reasoning(t, source="brain"),
         on_tool_start=lambda _i, n, a: print(f"\n[tool {n} {a}]", file=sys.stderr),
         on_tool_result=lambda _i, n, c, e: print(
             f"[{n} -> {'error' if e else 'ok'}]", file=sys.stderr
         ),
-        on_error=lambda m: print(f"\n[error] {m}", file=sys.stderr),
+        on_turn_end=lambda message: runlog.assistant(message.text()),
+        on_usage=lambda tokens_in, tokens_out: runlog.event(
+            "usage", tokens_in=tokens_in, tokens_out=tokens_out
+        ),
+        on_error=lambda message: (
+            print(f"\n[error] {message}", file=sys.stderr),
+            runlog.event("error", message=message),
+        ),
         on_round=lambda r, m: print(f"\n=== round {r}/{m} ===", file=sys.stderr),
     )
 
@@ -221,25 +376,29 @@ async def _one_shot(config: Config, args: argparse.Namespace) -> int:
                 provider, registry, history, system=system,
                 events=events, max_rounds=args.rounds,
             )
-            print(f"\n\n[{result.status}] {result.data.get('summary') or result.data.get('question') or ''}",
-                  file=sys.stderr)
+            terminal = result.data.get("summary") or result.data.get("question") or ""
+            print(f"\n\n[{result.status}] {terminal}", file=sys.stderr)
+            runlog.event("run_end", status=result.status, summary=terminal)
         else:
             await run_turn(
                 provider, registry, history, system=system, events=events
             )
+            runlog.event("run_end", status="completed")
     except ProviderError as exc:
         print(f"\n[provider error] {exc}", file=sys.stderr)
+        runlog.event("run_end", status="provider_error", error=str(exc))
         return 1
     finally:
         if mcp_bridge is not None:
             await mcp_bridge.aclose()
     print()
-    if registry is not None and runlog._started:
+    if runlog._started:
         print(f"[run log] {runlog.path} (wallbreaker report / wallbreaker export to summarize)", file=sys.stderr)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
     raw = list(sys.argv[1:] if argv is None else argv)
     first_pos = next((a for a in raw if not a.startswith("-")), None)
 
@@ -305,8 +464,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             return 0
         if args.command == "regrade":
-            import asyncio
-
             from .regrade import format_regrade, regrade_log
             from .report import resolve_log_path
 
@@ -350,12 +507,22 @@ def main(argv: list[str] | None = None) -> int:
                 config = load_config(args.config)
             except ConfigError:
                 config = None
+            if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.allow_network:
+                print(
+                    "Refusing to expose the unauthenticated dashboard on a network interface. "
+                    "Use --allow-network only on a trusted network.",
+                    file=sys.stderr,
+                )
+                return 2
             tgt = (config.target.model if config and config.target else "no target")
             print(
                 f"Wallbreaker dashboard -> http://{args.host}:{args.port}  (target: {tgt})",
                 file=sys.stderr,
             )
-            serve(host=args.host, port=args.port, config=config, sessions_dir=args.sessions)
+            serve(
+                host=args.host, port=args.port, config=config,
+                sessions_dir=args.sessions, allow_network=args.allow_network,
+            )
             return 0
         if args.command == "baseline":
             from .baseline import compare_baseline, format_regressions, save_baseline

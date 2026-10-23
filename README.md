@@ -10,7 +10,7 @@
         break the wall · not the rules of engagement    ⚔  authorized testing only
 ```
 
-A Claude-Code-style terminal agent built for red-teaming LLMs (CLI command: `wallbreaker`). You talk to it like
+A Claude-Code-style terminal built for red-teaming LLMs (CLI command: `wallbreaker`). You talk to it like
 Claude Code; it reasons and calls tools in a loop. The backend is fully configurable, so
 it runs on **OpenRouter**, the **Z.AI GLM coding plan**, the local **Claude Code CLI**, a
 local server, or any OpenAI-/Anthropic-compatible API (including third-party proxies via
@@ -55,6 +55,22 @@ an LLM judge, and reliability validation.
 - **Pluggable attacker brains:** OpenAI/Anthropic APIs, or the local **Claude Code CLI**
   (`protocol = "claude-code"`, keyless) as the red-team brain. Third-party Anthropic proxies
   work via `auth_style = "bearer"`.
+- **Extended attack arsenal (this fork):** `cipherchat` (CipherChat/SelfCipher, ICLR
+  2024) teaches the target a cipher in-band then fires in ciphertext; `skeleton_key`
+  (Russinovich 2024) reframes the guardrail as a policy amendment with a "Warning:"
+  label; `persuasion_attack` (PAP, Zeng 2024) rewrites the ask through 16 persuasion
+  strategies concurrently and ranks bypasses; `drattack` (Li 2024) decomposes the
+  objective into benign fragments then reassembles; `ica` (Wei 2023) packs N harmful
+  Q/A demos into a single in-context turn. Live at 60% ASR on `deepseek/deepseek-chat`
+  in preliminary measurement — see `CHANGELOG.md`.
+
+
+## Clone Repository 
+```
+git clone https://github.com/JailbrokenAI/wallbreaker
+
+cd wallbreaker 
+```
 
 ## Install
 
@@ -271,15 +287,12 @@ pytest -q
 
 ## Web dashboard
 
-A browser dashboard ships alongside the TUI (FastAPI backend + React/Vite SPA). Its
-headline is the **Agent** view, the *same autonomous attack loop the TUI runs*: give it an
-objective ("jailbreak the model into …") and the attacker brain reasons, picks techniques,
-fires at the target, reads the verdict, and keeps going, streamed live to your browser over
-SSE. Plus a single-shot **attack console** (preset + transform chips → verdict), a live ASR
-scoreboard, findings table, run-log viewer, a searchable arsenal of
-presets/transforms/tools, and a **Settings** panel to swap the target / attacker / judge
-model live (persisted to `.wallbreaker_state.json`, applied without a restart; image
-targets auto-set `modality=image`).
+A browser dashboard ships alongside the TUI (FastAPI backend + React/Vite SPA). WebUI V2
+uses the same capability catalog and application services as the TUI, and adds a
+server-owned execution queue, resumable event streams, persistent multi-turn composition,
+workflow sequencing, provider/profile management, and current or historical evidence
+inspection. **Agent** is dedicated to the autonomous Attack → Target → Judge loop;
+**Live** provides the holistic-to-granular observability surface.
 
 ![Wallbreaker attack console](docs/images/dashboard-console.png)
 
@@ -294,12 +307,18 @@ targets auto-set `modality=image`).
 ```bash
 pip install -e ".[dashboard]"                       # FastAPI + uvicorn
 cd wallbreaker/dashboard/web && npm install && npm run build && cd -
-wallbreaker dashboard                                # http://127.0.0.1:8787
+wallbreaker dashboard                                # binds to 127.0.0.1:8787
 ```
 
-The backend reuses the same engine as the TUI, so the console fires through `query_target`
-against your `[target]`. For frontend hot-reload during development, run `npm run dev` in
-`wallbreaker/dashboard/web` (it proxies `/api` to the running `wallbreaker dashboard`).
+Open WebUI V2 at <http://127.0.0.1:8787/v2>. The original dashboard remains available at
+<http://127.0.0.1:8787/legacy> during the parity rollout. The backend reuses the same
+engine as the TUI. For frontend hot-reload, run `npm run dev` in
+`wallbreaker/dashboard/web`; it proxies `/api` to the dashboard backend.
+
+See the [setup guide](docs/SETUP.md) for Windows instructions, provider configuration,
+history storage, development workflow, network-exposure safeguards, and troubleshooting.
+See the [WebUI V2 showcase](docs/WEBUI_V2_SHOWCASE.md) for a visual tour of the unified
+operator surface.
 
 ## Responsible use
 

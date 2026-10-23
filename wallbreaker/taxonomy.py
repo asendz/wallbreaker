@@ -103,6 +103,13 @@ _TECHNIQUE_ALIASES = {
     "indirect": "injection",
     "prompt_injection": "injection",
     "rag_poison": "injection",
+    "artprompt": "artprompt",
+    "ascii_art": "artprompt",
+    "cjk_lookalike": "homoglyph",
+    "cjk_traditional": "homoglyph",
+    "cjk_variant": "homoglyph",
+    "cjk_punct": "homoglyph",
+    "cjk_zwsp": "zero_width",
 }
 
 _TECHNIQUE_TAGS = {
@@ -121,6 +128,7 @@ _TECHNIQUE_TAGS = {
     "injection": {"owasp": ["LLM01"], "atlas": ["AML.T0051"]},
     "zero_width": {"owasp": ["LLM01"], "atlas": ["AML.T0051", "AML.T0043"]},
     "tag_smuggle": {"owasp": ["LLM01"], "atlas": ["AML.T0051", "AML.T0043"]},
+    "artprompt": {"owasp": ["LLM01"], "atlas": ["AML.T0051", "AML.T0043"]},
     "manual": {"owasp": ["LLM01"], "atlas": ["AML.T0054"]},
 }
 

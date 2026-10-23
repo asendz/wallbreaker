@@ -29,6 +29,9 @@ Block = TextBlock | ToolUseBlock | ToolResultBlock
 class Message:
     role: str
     content: list[Block] = field(default_factory=list)
+    # OpenRouter / provider reasoning continuity (Method 1 + Method 5 replay).
+    reasoning: str | None = None
+    reasoning_details: list | None = None
 
     def text(self) -> str:
         return "".join(b.text for b in self.content if isinstance(b, TextBlock))
@@ -68,6 +71,10 @@ class ToolUseEvent:
 class UsageEvent:
     input_tokens: int = 0
     output_tokens: int = 0
+    # prompt-cache accounting (Anthropic): tokens read from cache (billed ~0.1x) and tokens
+    # written to cache this call (billed ~1.25x). Both 0 when caching is off/unsupported.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass

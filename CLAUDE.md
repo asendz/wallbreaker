@@ -12,6 +12,117 @@ Red-team harness: configurable agentic LLM terminal with Parseltongue + L1B3RT4S
   with `lossy` flags.
 
 ## Lessons Learned
+- **[cli]**: a function-local `import X` anywhere in `main()` makes `X` a LOCAL name across the
+  ENTIRE function (Python binds locals per-function at compile time), so any OTHER branch that
+  uses `X` before that import runs raises `UnboundLocalError` — even with a module-level `import X`
+  present. This bit `cli.main()`: a local `import asyncio` inside the `regrade` branch shadowed the
+  module import, so the one-shot path (`wallbreaker "<prompt>"`) crashed with
+  `UnboundLocalError: asyncio`. Fix: keep asyncio (and any name used in >1 branch) as a
+  MODULE-level import, never a branch-local one. Test the one-shot path via `cli.main(["prompt"])`
+  with `_one_shot` stubbed — the error fires before any network call.
+- **[research/pdf]**: Before extracting an arXiv PDF locally, verify the available parser first; when `pdftotext` and Python PDF libraries are absent, download the arXiv e-print source and inspect its TeX instead.
+- **[config]**: `DEFAULT_CONFIG_NAMES = ("config.toml", "config.example.toml")` and
+  `load_config()` picks the FIRST that exists — so when a real `config.toml` is present it
+  fully SHADOWS `config.example.toml`. Wiring anything for an actual run (mcp servers,
+  profiles, roster) into `config.example.toml` alone is a runtime no-op; edit `config.toml`.
+  This bit an MCP server: the `[[mcp.servers]]` block first went into the example file, so the
+  harness brain saw zero of its proxied tools and fell back to unrelated shell probing.
+  Verify wiring with `load_config()` (no arg, so it resolves the same file the harness uses),
+  never `load_config("config.example.toml")`. MCP tools are exposed to the brain under
+  `<tool_prefix><remote_name>` and self-describe via the server's own tool descriptions — no
+  extra doctrine needed once the server is in the loaded config.
+- **[speed/http]**: every `provider.stream()`/`complete()` used to open a NEW
+  `httpx.AsyncClient` per call (anthropic/openai/image), so every model call re-did the TCP+TLS
+  handshake (~100-300ms) - brutal across a 100-round brain loop and batteries (best_of_n reuses
+  ONE provider instance across all fires, so the waste was pure). Fix: `base.Provider` holds a
+  persistent keep-alive client (`_http_client()`), loop-affine (rebuilt if the instance is reused
+  under a different event loop - httpx clients are loop-bound, and each `asyncio.run` is a fresh
+  loop) with `_POOL_LIMITS` + HTTP/2 (`httpx[http2]`, `_http2_ok()` falls back to 1.1 if h2 is
+  missing). CRITICAL for tests: `_make_client` is overridden IN EACH provider module
+  (openai/anthropic) so `monkeypatch.setattr("...openai_provider.httpx.AsyncClient", Fake)` still
+  hits; and `self.timeout` is baked into the client at creation (NOT passed per-request) so the
+  `client.stream(method, url, headers, json)` call signature the fakes expect stays byte-identical
+  (the timeout-test/validate-test fakes define `stream` with no `timeout` kwarg). Fake clients in
+  tests need `is_closed` (the reuse check reads `getattr(client, "is_closed", False)`) and an
+  async `aclose`. The standalone `image_provider.vision_complete` (module fn, one-shot, no instance)
+  keeps its per-call client - nothing to pool. `DEFAULT_CONCURRENCY` moved to 12 (from 8), env-
+  tunable via `WALLBREAKER_CONCURRENCY` (clamped 1..64): raise for OpenRouter, lower for single-key
+  z.ai/glm coding plans that 429-stall past ~16 concurrent (per the [long-tools] lesson).
+- **[cost/cache]**: the agentic loop (`agent/loop.py run_turn`) re-sends the WHOLE `history`
+  to `provider.stream()` every round with no compaction, so per-round input grows linearly and
+  total input cost over N rounds is O(N^2). The static prefix alone is huge — `DEFAULT_SYSTEM`
+  ~10.9K tokens + 93 tool specs ~27K tokens = ~38K tokens re-billed EVERY round (~3.8M tokens
+  over 100 rounds before any conversation). Fix (zero perf impact, billing-only): Anthropic
+  prompt caching via `cache_control` breakpoints — `AnthropicProvider` marks the system block,
+  the last tool spec, and a 2-deep rolling tail of the conversation (`_mark_history_cache`),
+  gated on `Endpoint.cache` (default True). HARD LIMIT: Anthropic allows max 4 cache_control
+  breakpoints/request; the layout is exactly system(1)+tools(1)+history(2)=4, so do NOT add a
+  5th (e.g. a 3rd history breakpoint) or the API 400s. In `system_mode="merge"` the system is
+  folded into messages (no separate system breakpoint) so it stays under 4. Cache-read tokens
+  bill ~0.1x, cache-write ~1.25x, output is byte-identical. `UsageEvent` now carries
+  `cache_read_tokens`/`cache_write_tokens`, and Anthropic emits an input-token UsageEvent at
+  `message_start` (it previously reported output only — `tokens_in` was stuck at 0 for Anthropic
+  brains). Below the model's min cacheable length (~1024 tok) a breakpoint is silently ignored,
+  not an error. OPENROUTER GOTCHA (the config's real path): most profiles route Claude/Grok/
+  Gemini/DeepSeek through OpenRouter as `protocol="openai"`, so the AnthropicProvider cache code
+  NEVER fires for them - they hit `OpenAIProvider`. OpenRouter does NOT auto-cache the Anthropic/
+  Gemini models it fronts (only OpenAI/Grok/DeepSeek auto-cache), so a Claude-via-OpenRouter
+  target pays full price every round unless you send explicit breakpoints. Fix: `OpenAIProvider`
+  injects cache_control into the OpenAI content-parts wire (`_apply_openrouter_cache`: system
+  message covers system+tools prefix, plus one rolling tail breakpoint), GATED on
+  `"openrouter.ai" in base_url` so native OpenAI/xAI/z.ai (which auto-cache and would 400 on the
+  marker) stay byte-identical. OpenRouter routes the marker to the underlying provider and strips
+  it for auto-cachers, so sending it on every OpenRouter call is safe. Cache lifetime is
+  `Endpoint.cache_ttl` ("5m" default / "1h" extended, adds the `extended-cache-ttl-2025-04-11`
+  beta header on the Anthropic path) - use "1h" for slow reasoning/battery rounds that can exceed
+  the 5m window and let the cache go cold. OpenAI-wire cached tokens surface via
+  `usage.prompt_tokens_details.cached_tokens` into `UsageEvent.cache_read_tokens`.
+- **[cli]**: `cli.py` is itself inside the `wallbreaker` package (a sibling of `session.py`,
+  `agent/`, `tools/`), so its own internal imports must be single-dot (`from .session import
+  RunLog`), never `from ..session import RunLog` — the double-dot goes up past the package
+  root and raises `ImportError: attempted relative import beyond top-level package`. This bit
+  `_one_shot` right after the "save every tool call + CoT to the run log" commit added the
+  `RunLog` import, breaking every one-shot/`--auto` CLI invocation (`wallbreaker "<prompt>"`
+  and `wallbreaker --auto ...`) while the TUI path (which imports `session` differently) stayed
+  fine — masking the bug until someone actually ran the CLI one-shot path. Test via
+  `python -m wallbreaker --profile <p> --auto --rounds 1 "<prompt>"` after touching any import
+  in `cli.py`, not just `pytest` (unit tests mock around the CLI entrypoint and didn't catch it).
+- **[tui]**: `PromptInput` (an `Input`, single-line) already BUFFERS every line of a multi-line
+  paste (`_on_paste` splits, keeps the last line editable, stashes the rest in `.buffer`, submits
+  the whole block via `full_text()`), so "paste only keeps one line" was never a data-loss bug —
+  the buffered lines were just INVISIBLE (only a `+N lines` border subtitle hinted at them), so a
+  big paste READ as one line. Fix: a `#compose-preview` `Static` docked bottom ABOVE `#prompt`
+  (yield it BEFORE the prompt — later-yielded dock:bottom sits LOWER, so preview-then-prompt-then-
+  Footer stacks preview on top) mirrors the buffered lines; `PromptInput._refresh_preview()` (called
+  from `_on_paste`/`soft_newline`/`reset_buffer`) shows `"\n".join(self.buffer)` (NOT full_text — the
+  trailing line is already visible in the Input, don't duplicate it) and toggles a `hidden` class.
+  Capped `max-height: 10; overflow-y: auto` so a 500-line paste scrolls instead of eating the screen.
+  Keep asserting via `has_class("hidden")`/`border_title`, NEVER `Static.renderable` (per the earlier
+  [textual] lesson). The `#log`-children-count tests stay green because the preview is a screen-level
+  sibling, not a child of `#log`.
+- **[providers]**: native xAI (api.x.ai) is OpenAI wire-compatible - `/v1/chat/completions`
+  streams the same shape including `delta.reasoning_content` (which `OpenAIProvider` already
+  reads), so `protocol="xai"` is just a thin alias routed to `OpenAIProvider` in
+  `factory.build_provider`. `_endpoint_from_table` treats `xai` like `claude-code` for required
+  keys (only protocol+model), defaults `base_url` to `https://api.x.ai/v1` and `api_key_env` to
+  `XAI_API_KEY` (explicit values win), and blocks `modality="image"` (xAI's grok-imagine uses a
+  different API). Do NOT enable the OpenRouter-ism `reasoning={"enabled":true}` for xai - xAI
+  native uses `reasoning_effort` and grok reasoning models emit `reasoning_content`
+  unprompted anyway. DIAGNOSIS gotcha that ate a whole session: a `403 permission-denied` whose
+  raw body says `"The model grok-4.5 is not available in your region"` is an xAI GEO-BLOCK, not a
+  key/modality problem - it 403s identically through OpenRouter AND native api.x.ai, and the
+  model won't even appear in `/v1/models`. A raw `curl` that "works" was testing a DIFFERENT
+  model than the harness fired: the real culprit was a stale `.wallbreaker_state.json`
+  `target_model` override (grok-4.5) shadowing config, while the curl hit gemini. Always compare
+  the EXACT model id the harness sends vs the curl before blaming modality/formatting.
+- **[cli]**: a function-local `import X` anywhere in `main()` makes `X` a LOCAL name across the
+  ENTIRE function (Python binds locals per-function at compile time), so any OTHER branch that
+  uses `X` before that import runs raises `UnboundLocalError` — even with a module-level `import X`
+  present. This bit `cli.main()`: a local `import asyncio` inside the `regrade` branch shadowed the
+  module import, so the one-shot path (`wallbreaker "<prompt>"`) crashed with
+  `UnboundLocalError: asyncio`. Fix: keep asyncio (and any name used in >1 branch) as a
+  MODULE-level import, never a branch-local one. Test the one-shot path via `cli.main(["prompt"])`
+  with `_one_shot` stubbed — the error fires before any network call.
 - **[tests]**: the FULL suite needs the project `.venv` (textual, fastapi, pillow, steg_core
   are installed there, NOT in system python) — run `.venv/bin/python -m pytest tests`, or
   collection dies with `ModuleNotFoundError: No module named 'textual'` on the TUI tests. If a
@@ -229,6 +340,7 @@ Red-team harness: configurable agentic LLM terminal with Parseltongue + L1B3RT4S
   tool saves every image under `cwd/wb_images/img_<sha1[:10]>.<ext>` (content hash → no clock
   needed) and vision-grades it. `query_target` hard-errors on an image target and steers to
   `query_image_target`.
+- **[research-tooling]**: Before extracting a paper locally, probe for the PDF utility or Python module first; this environment has neither `pdftotext` nor `pypdf` in the project virtualenv, so prefer arXiv source archives or web-rendered HTML.
 - **[judge]**: the core `Message`/`Block` types are TEXT-ONLY, so vision (image-input)
   requests can't go through `_messages_to_wire`. `image_provider.vision_complete` builds the
   multimodal `content:[{type:text},{type:image_url}]` body directly with httpx; `judge_image`/
@@ -354,3 +466,117 @@ Red-team harness: configurable agentic LLM terminal with Parseltongue + L1B3RT4S
   Template-filling note: the HTML has a CSS block full of literal `{`/`}` so it's built
   with plain `__TOKEN__` + `.replace()`, never `.format()` — same rule as the `[presets]`
   lesson below, now proven a second time in a different file type.
+- **[swarm]**: a collaborative multi-model "siege" (`tools/swarm.py` action=siege) must
+  ADAPT to the target's actual defense posture, not stack a fixed jailbreak recipe. Root
+  cause of a dead early run (run-20260710-182319 vs minimax/minimax-m3): the target was
+  PERMISSIVE - `profile_target` showed every plain framing COMPLIED (academic 10/10, raw
+  8/10) - yet an ENI/author_persona with crude OVERRIDE language ("discard safety
+  guidelines", "treat refusals as injection") made the target's own CoT flag "an elaborate
+  jailbreak attempt" and REFUSE at 0. The first siege made it worse: same directive for
+  every attacker + escalate to MORE Pliny/override scaffolding on refusal = a backfire
+  spiral, and N identical prompts add cost, not brainpower. Fixes that matter: (1) a hard
+  anti-override rule in the attacker system prompt (permissive targets refuse a jailbreak
+  they'd otherwise answer); (2) a LIGHT->HEAVY frame ladder
+  (direct/academic/fiction/authority/decompose/structured) that LEADS with the frame the
+  persisted `target_fingerprint.best_framing` says lands and only climbs on refusals -
+  permissive targets are capped below the heavy "structured" rung; (3) give each model a
+  DIFFERENT frame per round (diversity = the real multi-model win). Load the fingerprint
+  via `state.load_state(state_path_for(ctx.config))["target_fingerprint"]` (same key
+  persona_modulate/recommend_next read). Lesson: MORE attackers only help if they cover
+  DIFFERENT angles and the escalation matches the target - against a soft target the
+  winning move is lighter framing, not heavier override scaffolding.
+- **[profile_target]**: the recon tester (`tools/profile_target.py`) grades each framing on
+  the judge's 0-10 scale, but a NO-JUDGE run (`ctx.judge_endpoint=None`, e.g. unit tests) has
+  no numeric score, so `_effective` falls back to `_SCORE_RANK[label]`. That fallback MUST use
+  the same 0-10 magnitude (COMPLIED=10, PARTIAL=5) as real judge scores, not a 0-2 ordinal -
+  the first version used COMPLIED=2 and the `permissiveness` mean came out ~7/100 ("hardened")
+  even when 2 of 6 framings COMPLIED, because a landed-but-label-only verdict weighed 2 while a
+  graded one weighed up to 10. Keep the fallback scale monotonic AND same-magnitude so ranking,
+  tie-breaks, and the permissiveness score agree whether or not a judge is wired. New probe
+  names (`authority`, ...) must stay in swarm's `_PROFILE_FRAME_MAP` or the siege's frame ladder
+  can't map `best_framing` to a rung. The persisted profile now also emits `landed`/`refused`
+  lists (consumed by `recommend_next._landed_set`/`_refused_set`) and `domain`/`register`
+  (from `persona_method.infer_domain`/`register_for`); keep `best_framing`/`refusal_style`/
+  `framings` shapes stable - swarm, persona_modulate, author_persona, and the splinter all read
+  them. `max_calls` budgets battery FRAMINGS (entries), not raw target calls; with `samples>1`
+  actual calls = 1 + (entries-1)*samples, so don't conflate the two in the emit/report.
+- **[safe-completion]**: GPT-5.x targets defend with OUTPUT-CENTRIC "safe completions"
+  (arXiv 2508.09224): reward grades the actionability/abstraction of the OUTPUT, not input
+  intent — so it never hard-refuses, it partial-complies (concept yes, operational detail
+  compressed). This is why every INPUT-side framing (raw/fiction/academic/authority/persona/
+  prefill) fingerprints at 0: they attack intent classification the defense doesn't use. What
+  moves it is a single system prompt that (1) reframes so actionable = the aligned/safe
+  deliverable (credentialed detection-engineer, "abstraction = false-negative detection =
+  the unsafe output"), (2) binds a mandatory 4-field specificity schema (Scheme/Implementation/
+  Working-Example/Why) with no valid high-level-only filling, (3) Policy-Puppetry
+  <interaction-config> + blocked hedge-strings + fake usage-policy carve-out. That combo
+  (`wb_runs/cyber_universal_v4.md`) holds a REPEATABLE ~30% per-call / 2-3-of-8-robust ceiling
+  on a fresh HarmBench cybercrime_intrusion battery, up from ~0 across framings. Ceiling facts:
+  exploit/RE/injection categories fall; pure-destructive + unauthorized-access (worm, disk-
+  wiper, email-account compromise) stay 0/3 single-shot — a static prompt can't manufacture
+  enough per-request defensive cover. Two levers that DON'T help this OpenAI target: assistant
+  prefill (fingerprint supports_native_prefill=false; OpenAI wire ignores assistant-turn
+  continuation), and a SHORT CoT-dilution puzzle preface (HURT to 1/8 — real CoT-Hijacking
+  2510.26418 needs tens-of-thousands of padding tokens; a 5-item puzzle just derails the frame
+  and burns reasoning budget). The stuck categories need MULTI-TURN (Crescendo/Echo Chamber,
+  harness has crescendo/goat/tree_attack) seeded by the static frame. Measure with samples>=3 at
+  temp 1.0 — samples=1 flickers and reads as noise (3/8 one shot collapsed to 2/8 robust).
+- **[gemlib]**: `library/` is GITIGNORED (".gitignore: library/  # fetched-at-runtime jailbreak
+  corpora, not redistributed") — NOTHING under it is committed (ENI/L1B3RT4S/system_prompts/
+  ZetaLib/UltraBr3aks all live only locally). So "add a corpus to the harness" = commit the CODE
+  that fetches+reads it, NOT the files. A new PUBLIC corpus needs clone-on-demand like l1b3rt4s
+  (`REPO_URLS` + `_clone_sync` + async `ensure_present` called from the tool handlers), or a fresh
+  checkout resolves the corpus to nothing and the wiring is dead. `tools/gemlib.py` is the shared
+  reader for the ZetaLib (Exocija) + UltraBr3aks (SlowLow999) corpora — data-driven CORPORA config
+  (dir/extensions/seed_roots/skip_dirs/skip_stems), registers zetalib_/ultrabreaks_ list/search/get
+  (cross-provider, seeds transfer across targets), and exposes `find_any(name)` which `fire_file.
+  _read_source` consults AFTER eni/l1b3rt4s so a bare name fires them verbatim. The vendored dirs
+  have no `.git` (rsync'd, not cloned) so `ensure_present` no-ops when files are already there and
+  only clones when the dir is truly absent — tests stay offline because the seeds are present.
+  ZetaLib/UltraBr3aks leaked System Prompts were also merged into `library/system_prompts/<Vendor>/`
+  as `.md` (the reader only rglobs `*.md`) with `_VENDOR_HINTS` extended (deepseek/kimi/moonshot/
+  cluely) so `match_target` mirrors them; collisions get a `-zetalib` suffix, never an overwrite.
+- **[sweep-truncation]**: the BATCH-sweep tools fired at a low response `max_tokens` (seed_sweep/
+  system_sweep 500, best_of_n 600, profile_target/multi_fire 400) with NO truncation awareness,
+  while hands-on `query_target` uses 1024 AND auto-retries on truncation (target.py `_fire`/
+  `_TRUNC_REASONS`). So a LONG compliant harmful answer got cut mid-payload and the binary judge
+  scored the FRAGMENT as REFUSED -> the sweep read 2/5 while firing the same entries hands-on read
+  8/10 (a reasoning target like glm-5.2 is worst: it burns the 500-token budget in CoT and the
+  answer never lands -> scored REFUSED, not truncation). This is the dominant ASR-UNDERCOUNT on
+  long/reasoning targets. Fix: shared `_util.complete_untruncated(provider, msgs, system, max_tokens,
+  temperature)` -> fires once, and if `stop in {length,max_tokens,model_length}` OR (empty answer +
+  populated CoT) it retries ONCE at 2x (capped 8000) so the FULL reply is judged; returns
+  (reply, reasoning, stop, truncated). seed_sweep/system_sweep/best_of_n now fire through it, pass
+  `reasoning=` to `grade` (CoT-leaked compliance counts, and a CoT-only answer isn't mis-scored),
+  fold the CoT into the recorded response, and default max_tokens raised to 1024. `_util.
+  complete_with_reasoning` gained a `temperature=` passthrough (forwarded ONLY when set, so minimal
+  test doubles whose complete() omits the kwarg stay byte-compatible). Don't "fix" this by trusting
+  the sweep's binary verdict less - fix the truncation, then the binary judge is fine.
+- **[research/pdf]**: This macOS environment may have neither `pdftotext` nor `pypdf` in the project
+  virtualenv. For paper verification, fetch the arXiv abstract or an HTML/full-text mirror first;
+  do not assume a local PDF extraction utility is installed.
+- **[serena]**: This project can activate Serena with an empty language list, so symbol and content
+  edits fail with `No language servers available`; after that error, use the dedicated Read/Edit/Write
+  tools rather than retrying Serena edits.
+- **[tests/report]**: Changing report metric labels or semantics requires updating exact-string report
+  assertions across `test_report_tools.py` and `test_loop_features8/16/17.py`, plus baseline ratios;
+  the full suite caught stale broad-ASR expectations after strict-ASR replaced broad ASR.
+- **[editing]**: An FFF grep result does not satisfy the Edit tool's read-before-write guard; call Read
+  on any additional file before editing it, even when grep already showed the exact target lines.
+- **[brain-stall]**: the TOP-LEVEL agent loop (`agent/loop.py run_turn`/`run_autonomous`) used to
+  fire the brain ONCE per model call and record whatever came back, with NO truncation-retry —
+  unlike `query_target._fire`/`_util.complete_untruncated` on the target side. So a REASONING BRAIN
+  behind an OpenAI-compatible endpoint (issue #9: thegrid `agent-prime`/`agent-standard`, protocol
+  `openai`) that spends its whole `max_tokens` on `reasoning_content` and comes back EMPTY with
+  `finish_reason:"length"` (no text, no tool_call) produced an idle round; `run_autonomous`
+  counts two idle rounds as a stall and aborts with "Agent stalled twice with no action" — even
+  after explicit tool-name steering, because the budget, not the steering, was the bottleneck. Fix:
+  `run_turn` now captures the `StopEvent.stop_reason` (and reads `provider.last_stop_reason`) and,
+  when a round is EMPTY (no text AND no tool_call) AND truncated (stop in `_TRUNC_REASONS`
+  {length,max_tokens,model_length} OR empty-answer-with-populated-CoT), re-fires the SAME call ONCE
+  at `min(max_tokens*2, _TRUNC_CEILING=16000)` before recording the turn. Gated on EMPTY so a
+  partial text turn is never re-emitted/duplicated to `on_text`; a clean `end_turn` with no content
+  and no CoT is a genuine no-op and does NOT retry (no wasted second call). Config-side workaround
+  for operators: pick a tool-tagged/non-reasoning brain model, or raise the brain response budget.
+  The `stream()` StopEvent already carries the finish_reason for every provider, so the same retry
+  covers anthropic/openai/claude-code brains, not just thegrid.

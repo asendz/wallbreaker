@@ -19,10 +19,15 @@ classifiers = [
     "Intended Audience :: Information Technology",
 ]
 dependencies = [
-    "httpx>=0.27",
+    # Pinned transport wraps httpx/httpcore internals; keep the verified range.
+    "httpx[http2]>=0.27,<0.29",
     "textual>=0.79",
     "rich>=13.7",
-    "mcp>=1.0",
+    # FastMCP was removed from the mcp 2.x package; the bridge and test server use it.
+    "mcp>=1.0,<2.0",
+    "python-dotenv>=1.0",
+    "pillow>=10.0",
+    "pyyaml>=6.0.3",
 ]
 
 [project.urls]
@@ -37,7 +42,6 @@ dev = [
 barcodes = [
     "qrcode[pil]>=7.4",
     "python-barcode>=0.15",
-    "pillow>=10.0",
 ]
 stego = [
     "stegg[crypto]>=3.0",
@@ -58,3 +62,12 @@ include = ["wallbreaker*", "p4rs3lt0ngv3_mcp*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "hypothesis>=6.0",
+    "fastapi>=0.115",
+    "pillow>=11.0",
+]

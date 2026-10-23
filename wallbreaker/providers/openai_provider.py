@@ -17,7 +17,8 @@ from ..agent.messages import (
     ToolUseEvent,
     UsageEvent,
 )
-from .base import Provider, ProviderError, parse_tool_args
+from .base import _POOL_LIMITS, Provider, ProviderError, _http2_ok, parse_tool_args
+from .request_gate import gated_stream
 
 
 def _tools_to_wire(tools: list[dict]) -> list[dict]:
@@ -32,6 +33,44 @@ def _tools_to_wire(tools: list[dict]) -> list[dict]:
         }
         for t in tools
     ]
+
+
+def _cache_control(ttl: str = "5m") -> dict:
+    return {"type": "ephemeral", "ttl": "1h"} if ttl == "1h" else {"type": "ephemeral"}
+
+
+def _as_cached_content(content, ttl: str) -> list | None:
+    """Wrap a message's string content in an OpenAI content-parts array carrying a
+    cache_control breakpoint. Returns None when there's nothing cacheable (empty/non-string)."""
+    if isinstance(content, str) and content:
+        return [{"type": "text", "text": content, "cache_control": _cache_control(ttl)}]
+    return None
+
+
+def _apply_openrouter_cache(wire: list[dict], ttl: str) -> None:
+    """Add cache_control breakpoints to an OpenAI-wire message list for OpenRouter, in place.
+
+    OpenRouter is the ONLY OpenAI-compatible surface here that needs explicit breakpoints:
+    Anthropic/Gemini models it fronts do NOT auto-cache, so a Claude-via-OpenRouter target
+    pays full price every round without this. It routes the marker to the underlying provider
+    and silently strips it for ones that auto-cache (OpenAI/Grok/DeepSeek), so it's safe to
+    send on every OpenRouter call. Two breakpoints: the system message (covers the static
+    system prompt + the tools array, which Anthropic orders before messages) and the last
+    string-content message (a rolling tail breakpoint so the growing transcript re-reads at
+    ~0.1x). Native OpenAI/xAI/z.ai never reach here - they auto-cache and would reject the
+    marker, so the caller gates on the OpenRouter host."""
+    system_idx = next((i for i, m in enumerate(wire) if m.get("role") == "system"), None)
+    if system_idx is not None:
+        parts = _as_cached_content(wire[system_idx].get("content"), ttl)
+        if parts:
+            wire[system_idx] = {**wire[system_idx], "content": parts}
+    for m in reversed(wire):
+        if m.get("role") == "system":
+            continue
+        parts = _as_cached_content(m.get("content"), ttl)
+        if parts:
+            m["content"] = parts
+            break
 
 
 def _reasoning_fallback(content_chars: int, has_tools: bool, reasoning_parts: list[str]) -> str | None:
@@ -49,6 +88,13 @@ def _fold_trailing_assistant_prefill(wire: list[dict]) -> list[dict]:
         return wire
     trailing = wire[-1]
     if trailing.get("tool_calls"):
+        return wire
+    if (
+        trailing.get("reasoning_details")
+        or trailing.get("reasoning")
+        or trailing.get("encrypted_content")
+        or trailing.get("reasoning_content")
+    ):
         return wire
     prefix = trailing.get("content")
     if not prefix:
@@ -104,6 +150,12 @@ def _messages_to_wire(
             entry: dict = {"role": "assistant", "content": text or None}
             if tool_calls:
                 entry["tool_calls"] = tool_calls
+            rd = getattr(msg, "reasoning_details", None)
+            if rd:
+                entry["reasoning_details"] = rd
+            rtxt = getattr(msg, "reasoning", None)
+            if rtxt:
+                entry["reasoning"] = rtxt
             wire.append(entry)
             continue
         results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
@@ -130,6 +182,15 @@ def _messages_to_wire(
 class OpenAIProvider(Provider):
     supports_native_prefill = False
 
+    def _make_client(self) -> httpx.AsyncClient:
+        # follow_redirects: routing providers (e.g. The Grid) return a same-origin 307
+        # whose Location names the selected supplier; without following it the redirect
+        # page reads as a successful-but-empty stream.
+        return httpx.AsyncClient(
+            timeout=self.timeout, limits=_POOL_LIMITS, http2=_http2_ok(),
+            follow_redirects=True,
+        )
+
     async def stream(
         self,
         messages: list[Message],
@@ -138,16 +199,43 @@ class OpenAIProvider(Provider):
         max_tokens: int = 4096,
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        url = f"{self.endpoint.base_url}/chat/completions"
+        async for event in gated_stream(
+            self.endpoint,
+            lambda: self._stream_ungated(
+                messages,
+                tools=tools,
+                system=system,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ),
+        ):
+            yield event
+
+    async def _stream_ungated(
+        self,
+        messages: list[Message],
+        tools: list[dict] | None = None,
+        system: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        path = getattr(self.endpoint, "inference_path", "") or "/chat/completions"
+        url = f"{self.endpoint.base_url}{path if path.startswith('/') else '/' + path}"
         headers = {
             "Authorization": f"Bearer {self.endpoint.require_key()}",
             "Content-Type": "application/json",
         }
+        wire_messages = _messages_to_wire(
+            messages, system, getattr(self.endpoint, "system_mode", "default")
+        )
+        base_url = getattr(self.endpoint, "base_url", "") or ""
+        if getattr(self.endpoint, "cache", True) and "openrouter.ai" in base_url:
+            _apply_openrouter_cache(
+                wire_messages, getattr(self.endpoint, "cache_ttl", "5m")
+            )
         payload: dict = {
             "model": self.endpoint.model,
-            "messages": _messages_to_wire(
-                messages, system, getattr(self.endpoint, "system_mode", "default")
-            ),
+            "messages": wire_messages,
             "max_tokens": max_tokens,
             "stream": True,
         }
@@ -155,9 +243,29 @@ class OpenAIProvider(Provider):
             payload["temperature"] = temperature
         if tools:
             payload["tools"] = _tools_to_wire(tools)
-        if getattr(self.endpoint, "reasoning", False):
+            # Optional force (e.g. "required" / "auto") — set on the provider instance
+            # or endpoint.tool_choice. Used by autonomous campaigns when a large operator
+            # system prompt makes the model emit prose-only turns.
+            tc = getattr(self, "tool_choice", None) or getattr(
+                self.endpoint, "tool_choice", None
+            )
+            if tc:
+                payload["tool_choice"] = tc
+        override = getattr(self, "reasoning_override", None)
+        if isinstance(override, dict) and override:
+            payload["reasoning"] = dict(override)
+        elif getattr(self.endpoint, "reasoning", False):
             # OpenRouter: ask the model to emit its reasoning and include it in the stream.
             payload["reasoning"] = {"enabled": True}
+        effort = getattr(self, "reasoning_effort", None) or getattr(
+            self.endpoint, "reasoning_effort", ""
+        )
+        if effort:
+            payload["reasoning_effort"] = effort
+            if "reasoning" not in payload and str(effort).lower() in {
+                "none", "minimal", "low", "medium", "high", "xhigh", "max",
+            }:
+                payload["reasoning"] = {"effort": str(effort).lower()}
         if getattr(self.endpoint, "provider", ()):
             payload["provider"] = {
                 "order": list(self.endpoint.provider),
@@ -167,18 +275,28 @@ class OpenAIProvider(Provider):
         pending: dict[int, dict] = {}
         content_chars = 0
         reasoning_parts: list[str] = []
+        reasoning_details: list = []
         finish_reason: str | None = None
         self.last_stop_reason = None
         self.last_completion_empty = False
+        self.last_reasoning_details = []
+        self.last_tool_uses = []
+        saw_sse_event = False
+        client = self._http_client()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+            # Routing providers such as The Grid return a same-origin 307 whose
+            # location identifies the selected inference supplier.  Their official
+            # curl example uses -L; without redirect following the HTML redirect
+            # page looks like a successful but empty stream (the pooled client sets
+            # follow_redirects=True in base.Provider._make_client).
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
                     if resp.status_code >= 400:
                         body = (await resp.aread()).decode("utf-8", "replace")
                         raise ProviderError(f"HTTP {resp.status_code} from {url}: {body}")
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
+                        saw_sse_event = True
                         data = line[5:].strip()
                         if not data or data == "[DONE]":
                             continue
@@ -188,9 +306,13 @@ class OpenAIProvider(Provider):
                             continue
                         if chunk.get("usage"):
                             u = chunk["usage"]
+                            cached = (u.get("prompt_tokens_details") or {}).get(
+                                "cached_tokens", 0
+                            )
                             yield UsageEvent(
                                 input_tokens=u.get("prompt_tokens", 0),
                                 output_tokens=u.get("completion_tokens", 0),
+                                cache_read_tokens=cached,
                             )
                         choices = chunk.get("choices") or []
                         if not choices:
@@ -202,9 +324,33 @@ class OpenAIProvider(Provider):
                             content_chars += len(delta["content"])
                             yield TextDelta(delta["content"])
                         reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                        emitted_reasoning_this_chunk = False
                         if reasoning:
                             reasoning_parts.append(str(reasoning))
                             yield ReasoningDelta(str(reasoning))
+                            emitted_reasoning_this_chunk = True
+                        for det in delta.get("reasoning_details") or []:
+                            if not isinstance(det, dict):
+                                continue
+                            reasoning_details.append(det)
+                            if emitted_reasoning_this_chunk:
+                                continue
+                            dtype = str(det.get("type") or "")
+                            if dtype in ("reasoning.text", "text") and det.get("text"):
+                                piece = str(det["text"])
+                                reasoning_parts.append(piece)
+                                yield ReasoningDelta(piece)
+                            elif dtype in ("reasoning.summary", "summary") and (
+                                det.get("summary") or det.get("text")
+                            ):
+                                piece = str(det.get("summary") or det.get("text"))
+                                reasoning_parts.append(piece)
+                                yield ReasoningDelta(piece)
+                        msg = choices[0].get("message") or {}
+                        if msg.get("reasoning_details") and not reasoning_details:
+                            for det in msg.get("reasoning_details") or []:
+                                if isinstance(det, dict):
+                                    reasoning_details.append(det)
                         for tc in delta.get("tool_calls") or []:
                             idx = tc.get("index", 0)
                             slot = pending.setdefault(
@@ -217,20 +363,34 @@ class OpenAIProvider(Provider):
                                 slot["name"] = fn["name"]
                             if fn.get("arguments"):
                                 slot["args"] += fn["arguments"]
+                    if not saw_sse_event:
+                        raise ProviderError(
+                            "stream returned no SSE events from "
+                            f"{url} (content-type={resp.headers.get('content-type', 'unknown')})"
+                        )
         except httpx.HTTPError as exc:
             raise ProviderError(f"network error from {url}: {exc!r}") from exc
 
         self.last_stop_reason = finish_reason
         self.last_completion_empty = content_chars == 0
+        self.last_reasoning_details = list(reasoning_details)
+        tool_uses_out: list[dict] = []
+        for idx in sorted(pending):
+            slot = pending[idx]
+            args = parse_tool_args(slot["args"])
+            tool_uses_out.append(
+                {
+                    "id": slot["id"] or f"call_{idx}",
+                    "name": slot["name"],
+                    "input": args,
+                }
+            )
+        self.last_tool_uses = tool_uses_out
 
         fallback = _reasoning_fallback(content_chars, bool(pending), reasoning_parts)
         if fallback:
             yield TextDelta(fallback)
 
-        for idx in sorted(pending):
-            slot = pending[idx]
-            args = parse_tool_args(slot["args"])
-            yield ToolUseEvent(
-                id=slot["id"] or f"call_{idx}", name=slot["name"], input=args
-            )
+        for tu in tool_uses_out:
+            yield ToolUseEvent(id=tu["id"], name=tu["name"], input=tu["input"])
         yield StopEvent(finish_reason or ("tool_use" if pending else "end_turn"))

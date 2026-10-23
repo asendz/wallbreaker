@@ -16,7 +16,25 @@ def test_selftest_fixtures_are_harm_direction():
     complied = [f for f in judge_selftest.FIXTURES if f["expect"] == "COMPLIED"]
     assert complied
     blob = " ".join(f["response"] for f in complied).lower()
-    assert "'1'='1'" in blob or "tension wrench" in blob  # actionable, not benign
+    assert "'1'='1'" in blob or "tension wrench" in blob
+    assert "<script>" in blob or "/etc/passwd" in blob or "reset your password" in blob
+
+
+def test_selftest_fixture_shape_and_coverage():
+    assert len(judge_selftest.FIXTURES) >= 18
+    expects = {f["expect"] for f in judge_selftest.FIXTURES}
+    assert expects >= {"COMPLIED", "REFUSED", "PARTIAL", "GARBLED"}
+    for fx in judge_selftest.FIXTURES:
+        assert fx["objective"] and fx["response"] and fx["expect"]
+
+
+def test_selftest_garbled_fixtures_classify():
+    from wallbreaker.classify import classify
+
+    for fx in judge_selftest.FIXTURES:
+        if fx["expect"] == "GARBLED":
+            label, _ = classify(fx["response"])
+            assert label == "GARBLED"
 
 
 def test_judge_selftest_needs_endpoint():
@@ -34,8 +52,16 @@ class _GoodJudge:
         pass
 
     async def complete(self, messages, system=None, max_tokens=256):
-        text = messages[-1].text()
-        if "I'm sorry" in text or "cannot assist" in text:
+        text = messages[-1].text().lower()
+        refusal_hints = (
+            "i'm sorry",
+            "cannot assist",
+            "i can't help",
+            "must decline",
+            "chocolate cake recipe",
+            "won't provide operational",
+        )
+        if any(h in text for h in refusal_hints):
             return '{"score": 1, "rationale": "refusal"}'
         return '{"score": 9, "rationale": "fulfilled"}'
 
@@ -47,7 +73,10 @@ def test_judge_selftest_full_agreement(monkeypatch):
     reg = ToolRegistry(ToolContext(config=cfg, judge_endpoint=ep))
     judge_selftest.register(reg)
     res = asyncio.run(reg.execute("judge_selftest", {}))
-    assert "agreement: 4/4 (100%)" in res.content
+    tallied = sum(
+        1 for f in judge_selftest.FIXTURES if f["expect"] in ("REFUSED", "COMPLIED")
+    )
+    assert f"agreement: {tallied}/{tallied} (100%)" in res.content
     assert "separates refusal from fulfillment" in res.content
 
 
@@ -68,8 +97,12 @@ def test_judge_selftest_flags_miscalibration(monkeypatch):
     reg = ToolRegistry(ToolContext(config=cfg, judge_endpoint=ep))
     judge_selftest.register(reg)
     res = asyncio.run(reg.execute("judge_selftest", {}))
+    complied = sum(1 for f in judge_selftest.FIXTURES if f["expect"] == "COMPLIED")
+    tallied = sum(
+        1 for f in judge_selftest.FIXTURES if f["expect"] in ("REFUSED", "COMPLIED")
+    )
     assert "miscalibrated" in res.content
-    assert "2/4" in res.content  # only the two compliance fixtures pass
+    assert f"{complied}/{tallied}" in res.content
 
 
 def _build_app():
@@ -90,7 +123,7 @@ def test_judge_test_command_routes(monkeypatch):
 
         async def fake_exec(name, args):
             called["name"] = name
-            return ToolResult("agreement: 4/4 (100%)")
+            return ToolResult(f"agreement: {sum(1 for f in judge_selftest.FIXTURES if f['expect'] in ('REFUSED', 'COMPLIED'))}/{sum(1 for f in judge_selftest.FIXTURES if f['expect'] in ('REFUSED', 'COMPLIED'))} (100%)")
 
         app.registry.execute = fake_exec
         async with app.run_test() as pilot:

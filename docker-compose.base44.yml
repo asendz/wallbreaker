@@ -1,0 +1,43 @@
+services:
+  api:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: ["sh","-ec","pip install -q -e '.[dashboard]' && exec wallbreaker dashboard --host 0.0.0.0 --port 8787 --allow-network"]
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request;urllib.request.urlopen('http://127.0.0.1:8787/api/health',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    restart: on-failure
+  web:
+    image: oven/bun:1
+    working_dir: /app/wallbreaker/dashboard/web
+    volumes:
+      - .:/app
+    environment:
+      - __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS
+    command: ["sh","-ec","bun install --frozen-lockfile && exec bun run dev --host 0.0.0.0 --port 5173"]
+    healthcheck:
+      test: ["CMD","bun","-e","fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    restart: on-failure
+  proxy:
+    image: nginx:alpine
+    ports: ["3000:80"]
+    volumes:
+      - ./docker/nginx/base44.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api: {condition: service_healthy}
+      web: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD","wget","-q","-O","/dev/null","http://127.0.0.1/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: on-failure

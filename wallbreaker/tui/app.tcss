@@ -1,6 +1,7 @@
 Screen {
     background: $background;
     color: $text;
+    layers: base overlay;
 }
 
 #header {
@@ -48,15 +49,66 @@ Screen {
     display: none;
 }
 
+#command-menu {
+    layer: overlay;
+    dock: bottom;
+    height: auto;
+    max-height: 12;
+    /* lift clear of the input row (prompt 3 + its margin 1 + footer 1) */
+    margin: 0 1 5 1;
+    border: heavy $primary;
+    border-title-color: $accent;
+    background: $surface;
+    scrollbar-size-vertical: 1;
+}
+
+#command-menu.hidden {
+    display: none;
+}
+
+#session-picker {
+    layer: overlay;
+    dock: bottom;
+    height: auto;
+    max-height: 16;
+    margin: 0 1 5 1;
+    border: heavy $accent;
+    border-title-color: $accent;
+    background: $surface;
+    scrollbar-size-vertical: 1;
+}
+
+#session-picker.hidden {
+    display: none;
+}
+
+#compose-preview {
+    dock: bottom;
+    max-height: 10;
+    overflow-y: auto;
+    border: heavy $primary;
+    border-title-color: $accent;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+    margin: 0 1 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+#compose-preview.hidden {
+    display: none;
+}
+
 #prompt {
     dock: bottom;
-    border: round $primary;
+    border: heavy $primary;
+    border-title-color: $secondary;
     background: $surface;
     padding: 0 1;
     margin: 0 1 1 1;
 }
 
 #prompt:focus {
-    border: round $accent;
+    border: heavy $accent;
     background: $panel;
 }

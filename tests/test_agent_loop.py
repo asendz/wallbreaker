@@ -74,6 +74,21 @@ async def test_loop_stops_without_tools():
     assert provider.calls == 1
 
 
+async def test_autonomous_stops_after_empty_model_response():
+    provider = ScriptedProvider([[StopEvent("end_turn")]])
+    errors = []
+    result = await run_autonomous(
+        provider,
+        _registry_with_control(),
+        [user("go")],
+        events=AgentEvents(on_error=errors.append),
+        max_rounds=8,
+    )
+    assert result.status == "error"
+    assert provider.calls == 1
+    assert errors == ["model returned an empty response (no text or tool call)"]
+
+
 async def test_autonomous_persists_then_finishes():
     from wallbreaker.agent.messages import ToolUseEvent
 

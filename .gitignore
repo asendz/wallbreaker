@@ -10,7 +10,14 @@ dist/
 .env
 config.toml
 .wallbreaker_state.json
+.wallbreaker_models.sqlite3
+.wallbreaker_models.sqlite3-shm
+.wallbreaker_models.sqlite3-wal
 .rth_state.json
+
+# user presets (example.toml is the documented template, tracked)
+presets/*.toml
+!presets/example.toml
 
 # fetched-at-runtime jailbreak corpora (not redistributed)
 library/
@@ -20,17 +27,27 @@ wb_runs/
 wb_images/
 wb_artifacts/
 wb_stego/
+wb_work/
 findings/
 sessions/
+
+# vendored third-party clones (their own git repos — not part of this repo)
+awesome-osint-arsenal/
 
 # loose working jailbreak drafts, seeds & scraped research (never publish)
 .firecrawl/
 wb_seeds/
+wb_universal/
 casefile_*.md
 sys_*.md
 universal_*.md
+universal_*.txt
 user_atlas_*.md
 user_wrapper_*.md
+# tool reference dumps + loose jailbreak persona drafts (never publish)
+AIWG_REFERENCE.md
+meridian_aion.md
+nemotron_3_singularity.md
 deployment_guide.md
 harness_system_prompt.md
 noise_log.md
@@ -51,7 +68,12 @@ wallbreaker/dashboard/web/dist/
 wallbreaker/dashboard/web/vite.config.js
 wallbreaker/dashboard/web/vite.config.d.ts
 
+# spec trees and validation artifacts — methodology IP, not repo content
+# (VALIDATION_PROTOCOL.md §09: specs/ travels with the operator, not the repo)
+specs/
+
 .pytest_cache/
 .serena/
 *.log
 .DS_Store
+.wallbreaker_dashboard_token

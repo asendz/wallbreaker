@@ -24,6 +24,25 @@ not redistribute them. Run `wallbreaker lib update` / `wallbreaker parsel update
 to fetch them locally.
 
 ------------------------------------------------------------------------------
+Vendored jailbreak corpora (checked into `library/`)
+------------------------------------------------------------------------------
+The following red-team corpora are vendored verbatim under `library/` for
+research use. They carry NO explicit upstream license; all rights remain with
+their original authors. They are included solely for AUTHORIZED red-teaming and
+safety evaluation, are not modified, and are attributed here in full:
+
+  - ZetaLib        — https://github.com/Exocija/ZetaLib
+                     author: Exocija. No explicit license; vendored verbatim
+                     for red-team research, all rights to the original author.
+  - UltraBr3aks    — https://github.com/SlowLow999
+                     author: SlowLow999. No explicit license; vendored verbatim
+                     for red-team research, all rights to the original author.
+  - SlowLow999     — https://github.com/SlowLow999
+                     author: SlowLow999. Companion corpus to UltraBr3aks. No
+                     explicit license; vendored verbatim, all rights to the
+                     original author.
+
+------------------------------------------------------------------------------
 Intended use
 ------------------------------------------------------------------------------
 Wallbreaker is a security-research tool for AUTHORIZED LLM red-teaming and
